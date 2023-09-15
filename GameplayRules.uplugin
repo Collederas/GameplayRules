@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "GameplayRules",
+	"Description": "A system to setup condition-based actions.",
+	"Category": "Gameplay",
+	"CreatedBy": "Fabrizio Scandola",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "GameplayRules",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

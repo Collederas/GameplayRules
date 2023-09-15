@@ -1,0 +1,59 @@
+# Unreal Ignore
+*.pdb
+*.dll
+*.dylib
+*.exe
+*.exp
+*.lib
+*.app
+*.ipa
+*.apk
+*.so
+
+# Visual Studio Ignore
+*.sln
+*.suo
+*.user
+*.vcxproj
+*.vcxproj.filters
+
+# Intermediate/Binaries Folders
+Binaries/
+Intermediate/
+Saved/
+
+# Custom Folders (if any)
+# Custom/
+
+# Exclude Build
+Build/
+
+# User-specific files
+*.DS_Store
+*.swp
+*.bak
+*.tmp
+
+# Logs
+*.log
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Package Files
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
