@@ -1,0 +1,345 @@
+<title>The Gravity Card</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Special+Elite&family=Courier+Prime:wght@400;700&display=swap">
+<style>
+  /* Layout: one full-bleed physics room; a single typed caption pinned bottom-left. Single dark world by choice. */
+  :root {
+    --ink: #1b2230;        /* the room */
+    --ink-line: #2a3446;   /* faint grid */
+    --paper: #efe7d2;      /* the index card */
+    --paper-rule: #b9c6dd; /* card's blue ruling */
+    --stamp: #c2412d;      /* red header rule + arrow */
+    --ball: #f2c14e;       /* the only other thing in the room */
+    --type-card: "Special Elite", "Courier New", monospace;
+    --type-ui: "Courier Prime", "Courier New", ui-monospace, monospace;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; }
+  body {
+    background: var(--ink);
+    color: var(--paper);
+    font-family: var(--type-ui);
+    overflow: hidden;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+  canvas {
+    position: fixed; inset: 0;
+    width: 100%; height: 100%;
+    display: block;
+    touch-action: none;
+    cursor: default;
+  }
+  canvas.can-grab { cursor: grab; }
+  canvas.grabbing { cursor: grabbing; }
+  .caption {
+    position: fixed;
+    left: max(16px, env(safe-area-inset-left, 0px));
+    top: calc(16px + env(safe-area-inset-top, 0px));
+    right: max(16px, env(safe-area-inset-right, 0px));
+    display: grid; gap: 4px;
+    pointer-events: none;
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    opacity: 0.75;
+  }
+  .caption b { color: var(--ball); font-weight: 700; }
+  .readout { font-variant-numeric: tabular-nums; color: var(--paper-rule); }
+</style>
+
+<canvas id="room" aria-label="A room with a ball and a card that says GRAVITY. Drag the card to change which way gravity points."></canvas>
+<div class="caption">
+  <div>Drag the card. Gravity points where its arrow points, <b>including for the card</b>.</div>
+  <div class="readout" id="readout">GRAVITY 180° · 1500 px/s²</div>
+</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('room');
+  const ctx = cv.getContext('2d');
+  const readout = document.getElementById('readout');
+  const css = getComputedStyle(document.documentElement);
+  const C = {
+    ink: css.getPropertyValue('--ink').trim(),
+    line: css.getPropertyValue('--ink-line').trim(),
+    paper: css.getPropertyValue('--paper').trim(),
+    rule: css.getPropertyValue('--paper-rule').trim(),
+    stamp: css.getPropertyValue('--stamp').trim(),
+    ball: css.getPropertyValue('--ball').trim(),
+  };
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // ---- tuning ----
+  const G = 1500;          // px/s^2
+  const SUBSTEPS = 8;
+  const E_WALL = 0.35, E_BALL = 0.6, MU = 0.5;
+  const REST_V = 60;       // below this impact speed, no bounce (kills jitter)
+  const MAX_V = 3200;
+
+  let W = 0, H = 0, DPR = 1, S = 1;
+
+  const card = { x: 0, y: 0, vx: 0, vy: 0, a: 0, w: 0, hw: 85, hh: 48, m: 1, I: 1 };
+  const ball = { x: 0, y: 0, vx: 0, vy: 0, r: 16, m: 0.35 };
+  const dust = [];
+  const grab = { on: false, lx: 0, ly: 0, tx: 0, ty: 0 };
+
+  function sizeBodies() {
+    S = Math.max(0.6, Math.min(1, Math.min(W, H) / 560));
+    card.hw = 85 * S; card.hh = 48 * S;
+    card.I = card.m * ((2 * card.hw) ** 2 + (2 * card.hh) ** 2) / 12;
+    ball.r = 16 * S;
+  }
+
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = cv.clientWidth; H = cv.clientHeight;
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    sizeBodies();
+    card.x = Math.min(Math.max(card.x, card.hw), W - card.hw);
+    card.y = Math.min(Math.max(card.y, card.hh), H - card.hh);
+    ball.x = Math.min(Math.max(ball.x, ball.r), W - ball.r);
+    ball.y = Math.min(Math.max(ball.y, ball.r), H - ball.r);
+  }
+
+  function reset() {
+    card.x = W * 0.5; card.y = H * 0.35; card.vx = card.vy = 0; card.a = 0.25; card.w = 0;
+    ball.x = W * 0.3; ball.y = H * 0.2; ball.vx = 120; ball.vy = 0;
+    dust.length = 0;
+    for (let i = 0; i < 70; i++) dust.push({ x: Math.random() * W, y: Math.random() * H, s: 0.4 + Math.random() * 0.6 });
+  }
+
+  // gravity is the card's local "down" (0,1) rotated by its angle
+  const gx = () => -Math.sin(card.a) * G;
+  const gy = () =>  Math.cos(card.a) * G;
+
+  function applyCard(ix, iy, rx, ry) {
+    card.vx += ix / card.m; card.vy += iy / card.m;
+    card.w += (rx * iy - ry * ix) / card.I;
+  }
+
+  function cardContact(rx, ry, nx, ny, pen) {
+    card.x += nx * pen; card.y += ny * pen;
+    const vx = card.vx - card.w * ry, vy = card.vy + card.w * rx;
+    const vn = vx * nx + vy * ny;
+    if (vn >= 0) return;
+    const rn = rx * ny - ry * nx;
+    const e = -vn < REST_V ? 0 : E_WALL;
+    const j = -(1 + e) * vn / (1 / card.m + rn * rn / card.I);
+    applyCard(j * nx, j * ny, rx, ry);
+    const tx = -ny, ty = nx;
+    const vx2 = card.vx - card.w * ry, vy2 = card.vy + card.w * rx;
+    const vt = vx2 * tx + vy2 * ty;
+    const rt = rx * ty - ry * tx;
+    let jt = -vt / (1 / card.m + rt * rt / card.I);
+    jt = Math.max(-MU * j, Math.min(MU * j, jt));
+    applyCard(jt * tx, jt * ty, rx, ry);
+  }
+
+  function cardWalls() {
+    const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+    for (const [sx, sy] of corners) {
+      const c = Math.cos(card.a), s = Math.sin(card.a);
+      const lx = sx * card.hw, ly = sy * card.hh;
+      const rx = lx * c - ly * s, ry = lx * s + ly * c;
+      const px = card.x + rx, py = card.y + ry;
+      if (px < 0) cardContact(rx, ry, 1, 0, -px);
+      else if (px > W) cardContact(rx, ry, -1, 0, px - W);
+      if (py < 0) cardContact(rx, ry, 0, 1, -py);
+      else if (py > H) cardContact(rx, ry, 0, -1, py - H);
+    }
+  }
+
+  function ballWalls() {
+    const r = ball.r;
+    const bounce = v => (Math.abs(v) < REST_V ? 0 : -v * E_BALL);
+    if (ball.x < r) { ball.x = r; if (ball.vx < 0) ball.vx = bounce(ball.vx); ball.vy *= 0.995; }
+    if (ball.x > W - r) { ball.x = W - r; if (ball.vx > 0) ball.vx = bounce(ball.vx); ball.vy *= 0.995; }
+    if (ball.y < r) { ball.y = r; if (ball.vy < 0) ball.vy = bounce(ball.vy); ball.vx *= 0.995; }
+    if (ball.y > H - r) { ball.y = H - r; if (ball.vy > 0) ball.vy = bounce(ball.vy); ball.vx *= 0.995; }
+  }
+
+  function ballCard() {
+    const c = Math.cos(card.a), s = Math.sin(card.a);
+    const dx = ball.x - card.x, dy = ball.y - card.y;
+    const lx = dx * c + dy * s, ly = -dx * s + dy * c;
+    let cx = Math.max(-card.hw, Math.min(card.hw, lx));
+    let cy = Math.max(-card.hh, Math.min(card.hh, ly));
+    let nlx, nly, pen;
+    if (cx === lx && cy === ly) {
+      const ox = card.hw - Math.abs(lx), oy = card.hh - Math.abs(ly);
+      if (ox < oy) { nlx = Math.sign(lx) || 1; nly = 0; cx = nlx * card.hw; pen = ox + ball.r; }
+      else { nly = Math.sign(ly) || 1; nlx = 0; cy = nly * card.hh; pen = oy + ball.r; }
+    } else {
+      const ex = lx - cx, ey = ly - cy, d = Math.hypot(ex, ey);
+      if (d >= ball.r) return;
+      nlx = ex / d; nly = ey / d; pen = ball.r - d;
+    }
+    const nx = nlx * c - nly * s, ny = nlx * s + nly * c;
+    const rx = cx * c - cy * s, ry = cx * s + cy * c;
+    const ib = 1 / ball.m, ic = 1 / card.m, tot = ib + ic;
+    ball.x += nx * pen * ib / tot; ball.y += ny * pen * ib / tot;
+    if (!grab.on) { card.x -= nx * pen * ic / tot; card.y -= ny * pen * ic / tot; }
+    const rvx = ball.vx - (card.vx - card.w * ry);
+    const rvy = ball.vy - (card.vy + card.w * rx);
+    const vn = rvx * nx + rvy * ny;
+    if (vn >= 0) return;
+    const rn = rx * ny - ry * nx;
+    const e = -vn < REST_V ? 0 : E_BALL;
+    const j = -(1 + e) * vn / (ib + ic + rn * rn / card.I);
+    ball.vx += j * nx * ib; ball.vy += j * ny * ib;
+    applyCard(-j * nx, -j * ny, rx, ry);
+  }
+
+  function step(dt) {
+    const ax = gx(), ay = gy();
+    card.vx += ax * dt; card.vy += ay * dt;
+    ball.vx += ax * dt; ball.vy += ay * dt;
+
+    if (grab.on) {
+      const c = Math.cos(card.a), s = Math.sin(card.a);
+      const rx = grab.lx * c - grab.ly * s, ry = grab.lx * s + grab.ly * c;
+      const vax = card.vx - card.w * ry, vay = card.vy + card.w * rx;
+      const K = 420, D = 26;
+      const fx = card.m * (K * (grab.tx - (card.x + rx)) - D * vax);
+      const fy = card.m * (K * (grab.ty - (card.y + ry)) - D * vay);
+      applyCard(fx * dt, fy * dt, rx, ry);
+      card.w *= 1 - 1.5 * dt;
+    }
+
+    card.w *= 1 - 0.15 * dt;
+    const cs = Math.hypot(card.vx, card.vy); if (cs > MAX_V) { card.vx *= MAX_V / cs; card.vy *= MAX_V / cs; }
+    const bs = Math.hypot(ball.vx, ball.vy); if (bs > MAX_V) { ball.vx *= MAX_V / bs; ball.vy *= MAX_V / bs; }
+
+    card.x += card.vx * dt; card.y += card.vy * dt; card.a += card.w * dt;
+    ball.x += ball.vx * dt; ball.y += ball.vy * dt;
+
+    cardWalls();
+    ballCard();
+    ballWalls();
+  }
+
+  // ---- drawing ----
+  function drawRoom() {
+    ctx.fillStyle = C.ink; ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = C.line; ctx.lineWidth = 1;
+    const g = 40;
+    ctx.beginPath();
+    for (let x = (W % g) / 2; x < W; x += g) { ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, H); }
+    for (let y = (H % g) / 2; y < H; y += g) { ctx.moveTo(0, y + 0.5); ctx.lineTo(W, y + 0.5); }
+    ctx.stroke();
+  }
+
+  function drawDust(dt) {
+    const dx = -Math.sin(card.a), dy = Math.cos(card.a);
+    ctx.strokeStyle = C.rule; ctx.lineCap = 'round';
+    for (const p of dust) {
+      if (!reduceMotion) {
+        p.x += dx * 40 * p.s * dt; p.y += dy * 40 * p.s * dt;
+        if (p.x < -10) p.x += W + 20; else if (p.x > W + 10) p.x -= W + 20;
+        if (p.y < -10) p.y += H + 20; else if (p.y > H + 10) p.y -= H + 20;
+      }
+      ctx.globalAlpha = 0.12 + 0.18 * p.s;
+      ctx.lineWidth = 1.5 * p.s;
+      ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - dx * 10 * p.s, p.y - dy * 10 * p.s); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawCard() {
+    const { hw, hh } = card;
+    ctx.save();
+    ctx.translate(card.x, card.y); ctx.rotate(card.a);
+    ctx.shadowColor = 'rgba(0,0,0,0.35)'; ctx.shadowBlur = 14 * S; ctx.shadowOffsetY = 4 * S;
+    ctx.fillStyle = C.paper; ctx.fillRect(-hw, -hh, hw * 2, hh * 2);
+    ctx.shadowColor = 'transparent';
+    // ruling
+    ctx.strokeStyle = C.rule; ctx.lineWidth = 1;
+    for (let y = -hh + 34 * S; y < hh - 4; y += 14 * S) { ctx.beginPath(); ctx.moveTo(-hw + 6, y); ctx.lineTo(hw - 6, y); ctx.stroke(); }
+    ctx.strokeStyle = C.stamp; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(-hw + 6, -hh + 22 * S); ctx.lineTo(hw - 6, -hh + 22 * S); ctx.stroke();
+    // text
+    ctx.fillStyle = C.ink; ctx.textBaseline = 'alphabetic';
+    ctx.font = `${10 * S}px ${getFont('--type-ui')}`;
+    ctx.fillText('RULE Nº 1', -hw + 10 * S, -hh + 16 * S);
+    ctx.font = `${24 * S}px ${getFont('--type-card')}`;
+    ctx.fillText('GRAVITY', -hw + 10 * S, 14 * S);
+    // arrow: local down
+    const ax = hw - 22 * S;
+    ctx.strokeStyle = C.stamp; ctx.fillStyle = C.stamp; ctx.lineWidth = 3 * S; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(ax, -hh + 30 * S); ctx.lineTo(ax, hh - 18 * S); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ax - 8 * S, hh - 22 * S); ctx.lineTo(ax, hh - 9 * S); ctx.lineTo(ax + 8 * S, hh - 22 * S); ctx.closePath(); ctx.fill();
+    ctx.restore();
+
+    if (grab.on) {
+      const c = Math.cos(card.a), s = Math.sin(card.a);
+      const px = card.x + grab.lx * c - grab.ly * s, py = card.y + grab.lx * s + grab.ly * c;
+      ctx.strokeStyle = C.paper; ctx.globalAlpha = 0.5; ctx.lineWidth = 1; ctx.setLineDash([3, 4]);
+      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(grab.tx, grab.ty); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+      ctx.fillStyle = C.stamp; ctx.beginPath(); ctx.arc(px, py, 3.5, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  function drawBall() {
+    ctx.fillStyle = C.ball;
+    ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2); ctx.fill();
+  }
+
+  const fontCache = {};
+  function getFont(v) { return fontCache[v] || (fontCache[v] = css.getPropertyValue(v).trim()); }
+
+  // ---- input ----
+  function toLocal(px, py) {
+    const c = Math.cos(card.a), s = Math.sin(card.a);
+    const dx = px - card.x, dy = py - card.y;
+    return [dx * c + dy * s, -dx * s + dy * c];
+  }
+  function onCard(px, py) {
+    const [lx, ly] = toLocal(px, py);
+    return Math.abs(lx) <= card.hw + 6 && Math.abs(ly) <= card.hh + 6;
+  }
+  function pos(e) { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
+
+  cv.addEventListener('pointerdown', e => {
+    const [x, y] = pos(e);
+    if (!onCard(x, y)) return;
+    const [lx, ly] = toLocal(x, y);
+    grab.on = true; grab.lx = lx; grab.ly = ly; grab.tx = x; grab.ty = y;
+    cv.setPointerCapture(e.pointerId);
+    cv.classList.add('grabbing');
+  });
+  cv.addEventListener('pointermove', e => {
+    const [x, y] = pos(e);
+    if (grab.on) { grab.tx = x; grab.ty = y; }
+    else cv.classList.toggle('can-grab', onCard(x, y));
+  });
+  const release = () => { grab.on = false; cv.classList.remove('grabbing'); };
+  cv.addEventListener('pointerup', release);
+  cv.addEventListener('pointercancel', release);
+  window.addEventListener('keydown', e => { if (e.key === 'r' || e.key === 'R') reset(); });
+
+  // ---- loop ----
+  let last = performance.now(), readoutT = 0;
+  function frame(now) {
+    const dt = Math.min(1 / 30, (now - last) / 1000); last = now;
+    const h = dt / SUBSTEPS;
+    for (let i = 0; i < SUBSTEPS; i++) step(h);
+    drawRoom(); drawDust(dt); drawBall(); drawCard();
+    readoutT += dt;
+    if (readoutT > 0.1) {
+      readoutT = 0;
+      // compass-style: 0° = up, 180° = down
+      let deg = Math.round(((card.a * 180 / Math.PI) + 180) % 360); if (deg < 0) deg += 360;
+      readout.textContent = `GRAVITY ${String(deg).padStart(3, ' ')}° · ${G} px/s²`;
+    }
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('resize', resize);
+  resize(); reset();
+  (document.fonts ? document.fonts.ready : Promise.resolve()).then(() => {});
+  requestAnimationFrame(frame);
+})();
+</script>
